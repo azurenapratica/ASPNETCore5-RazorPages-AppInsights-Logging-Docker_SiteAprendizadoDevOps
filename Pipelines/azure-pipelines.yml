@@ -1,0 +1,253 @@
+trigger:
+- main
+
+parameters:
+- name: webApps
+  type: object
+  default:
+  - multideployarmtemplate
+  - multideployazcli
+  - multideployportal
+  - multideploybicep
+  - multideployterraform
+
+variables:
+  buildPlatform: 'Any CPU'
+  buildConfiguration: 'Release'
+  IaCTemplates: ./SiteAprendizadoDevOps/IaC
+
+stages:
+- stage: Build
+  displayName: Build .Net Core
+  jobs: 
+  - job: DotNetCoreBuild
+    displayName: Build .Net Core
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: DotNetCoreCLI@2
+      displayName: .Net Core Restore
+      inputs:
+        command: restore
+        projects: '**/*.csproj'
+    - task: DotNetCoreCLI@2
+      displayName: .Net Core Build
+      inputs:
+        command: build
+        projects: '**/*.csproj'
+        arguments: '--configuration $(buildConfiguration)'
+    - task: DotNetCoreCLI@2
+      displayName: .Net Core Publish
+      inputs:
+        command: 'publish'
+        publishWebProjects: true
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)'
+    - task: CopyFiles@2
+      displayName: Copy IaC Templates
+      inputs:
+        SourceFolder: '$(IaCTemplates)'
+        Contents: '**'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+    - task: PublishBuildArtifacts@1
+      displayName: Artifacts Publish
+- stage: IaCARM
+  displayName: IaC ARM
+  dependsOn: Build
+  jobs:
+  - deployment: IaCARM
+    displayName: IaC ARM
+    environment: 'IaCARM'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureResourceManagerTemplateDeployment@3
+            displayName: IaC ARM Template
+            inputs:
+              deploymentScope: 'Resource Group'
+              azureResourceManagerConnection: '<<Service Connection Name>>'
+              subscriptionId: '<<Subscription ID>>'
+              action: 'Create Or Update Resource Group'
+              resourceGroupName: 'multideployarmtemplate-rg'
+              location: 'East US 2'
+              templateLocation: 'Linked artifact'
+              csmFile: '$(Agent.BuildDirectory)/**/webapp.json'
+              overrideParameters: '-webAppName multideployarmtemplate -hostingPlanName multideployarmtemplate-sp -sku "B1 Basic"'
+              deploymentMode: 'Incremental'
+- stage: IaCAZCLI
+  displayName: IaC Az CLI
+  dependsOn: Build
+  jobs:
+  - deployment: IaCAZCLI
+    displayName: IaC Az CLI
+    environment: 'IaCAZCLI'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: IaC Az CLI
+            inputs:
+              azureSubscription: '<<Service Connection Name>>'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az group create --location eastus2 --name multideployazcli-rg
+                az appservice plan create --name multideployazcli-sp --resource-group multideployazcli-rg --sku b1
+                az webapp create --resource-group multideployazcli-rg --plan multideployazcli-sp --name multideployazcli --runtime "DOTNET|5.0"
+- stage: IaCTerraForm
+  displayName: IaC TerraForm
+  dependsOn: Build
+  jobs:
+  - deployment: IaCTerraForm
+    displayName: IaC TerraForm
+    environment: 'IaCTerraForm'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: TerraformInstaller@0
+            displayName: Install TerraForm
+            inputs:
+              terraformVersion: '0.12.3'
+          - task: TerraformTaskV2@2
+            displayName: TerraForm Init
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(Agent.BuildDirectory)/drop/TerraForm'
+              backendServiceArm: '<<Service Connection Name>>'
+              backendAzureRmResourceGroupName: <<ResourceGroupTerraFormBackEnd>>'
+              backendAzureRmStorageAccountName: 'StorageAccountTerraFormBackEnd'
+              backendAzureRmContainerName: 'ContainerTerraFormBackEnd'
+              backendAzureRmKey: 'TFSTATETerraFormBackEnd'
+          - task: TerraformTaskV2@2
+            displayName: TerraForm plan
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(Agent.BuildDirectory)/drop/TerraForm'
+              environmentServiceNameAzureRM: '<<Service Connection Name>>'
+          - task: TerraformTaskV2@2
+            displayName: TerraForm Apply
+            inputs:
+              provider: 'azurerm'
+              command: 'apply'
+              workingDirectory: '$(Agent.BuildDirectory)/drop/TerraForm'
+              commandOptions: '-auto-approve'
+              environmentServiceNameAzureRM: '<<Service Connection Name>>'
+- stage: IaCBicep
+  displayName: IaC Bicep
+  dependsOn: Build
+  jobs:
+  - deployment: IaCBicep
+    displayName: IaC Bicep
+    environment: 'IaCBicep'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureCLI@2
+            displayName: IaC Bicep
+            inputs:
+              azureSubscription: '<<Service Connection Name>>'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                az group create --name multideploybicep-rg --location eastus2
+                az deployment group create --resource-group multideploybicep-rg --template-file $(Agent.BuildDirectory)/drop/Bicep/webapp.bicep
+- stage: multiDeploy
+  displayName: Deploy
+  dependsOn: [IaCARM, IaCAZCLI, IaCTerraForm, IaCBicep]
+  jobs:
+  - deployment: multiDeploy
+    displayName: Multi Deploy
+    environment: 'MultiDeploy'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - ${{ each value in parameters.webApps }}:
+            - task: AzureWebApp@1
+              displayName: Multi Deploy ${{ value }}
+              inputs:
+                azureSubscription: '<<Service Connection Name>>'
+                appType: 'webApp'
+                appName: ${{ value }}
+                package: '$(Agent.BuildDirectory)/**/*.zip'
+                deploymentMethod: 'auto'
+- stage: destroyResourceGroups
+  displayName: Destroy Resource Groups
+  dependsOn: multiDeploy
+  jobs:
+  - deployment: destroyResourceGroups
+    displayName: Destroy Resource Groups
+    environment: 'destroyResourceGroups'
+    pool:
+      vmImage: 'ubuntu-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureResourceManagerTemplateDeployment@3
+            displayName: Destroy ARM Template multideployarmtemplate-rg
+            inputs:
+              deploymentScope: 'Resource Group'
+              azureResourceManagerConnection: '<<Service Connection Name>>'
+              subscriptionId: '<<Subscription ID>>'
+              action: 'DeleteRG'
+              resourceGroupName: 'multideployarmtemplate-rg'
+          - task: AzureCLI@2
+            displayName: Destroy Az CLI multideployazcli-rg
+            inputs:
+              azureSubscription: '<<Service Connection Name>>'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: 'az group delete -n multideployazcli-rg --yes'
+          - task: TerraformInstaller@0
+            displayName: Install TerraForm
+            inputs:
+              terraformVersion: '0.12.3'
+          - task: TerraformTaskV2@2
+            displayName: TerraForm Init to Destroy
+            inputs:
+              provider: 'azurerm'
+              command: 'init'
+              workingDirectory: '$(Agent.BuildDirectory)/drop/TerraForm'
+              backendServiceArm: '<<Service Connection Name>>'
+              backendAzureRmResourceGroupName: <<ResourceGroupTerraFormBackEnd>>'
+              backendAzureRmStorageAccountName: 'StorageAccountTerraFormBackEnd'
+              backendAzureRmContainerName: 'ContainerTerraFormBackEnd'
+              backendAzureRmKey: 'TFSTATETerraFormBackEnd'
+          - task: TerraformTaskV2@2
+            displayName: TerraForm plan to Destroy
+            inputs:
+              provider: 'azurerm'
+              command: 'plan'
+              workingDirectory: '$(Agent.BuildDirectory)/drop/TerraForm'
+              environmentServiceNameAzureRM: '<<Service Connection Name>>'
+          - task: TerraformTaskV2@2
+            displayName: Destroy TerraForm multideployterraform-rg
+            inputs:
+              provider: 'azurerm'
+              command: 'destroy'
+              workingDirectory: '$(Agent.BuildDirectory)/drop/TerraForm'
+              environmentServiceNameAzureRM: '<<Service Connection Name>>'
+          - task: AzureCLI@2
+            displayName: Destroy Bicep multideploybicep-rg
+            inputs:
+              azureSubscription: '<<Service Connection Name>>'
+              scriptType: 'pscore'
+              scriptLocation: 'inlineScript'
+              inlineScript: 'az group delete -n multideploybicep-rg --yes'
+
